@@ -1,0 +1,186 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Automate CloudWatch Logs Infrequent Access migration for Amazon RDS and Amazon Aurora.
+  Deploys two Lambda functions (Initiator + Re-enabler), their IAM execution roles, and a
+  shared scoped IAM policy. The Initiator discovers tagged RDS/Aurora resources, disables log
+  exports, recreates their CloudWatch log groups in the target log class, and schedules a
+  one-time EventBridge rule that triggers the Re-enabler to re-enable exports, verify, email
+  via SES, and self-clean.
+
+Parameters:
+  SesSenderEmail:
+    Type: String
+    Description: Verified SES sender email address.
+  SesRecipientEmail:
+    Type: String
+    Description: Verified SES recipient email address.
+  TagKey:
+    Type: String
+    Default: rds-ia-migration
+    Description: RDS/Aurora tag key used to discover resources to migrate.
+  TagValue:
+    Type: String
+    Default: 'true'
+    Description: RDS/Aurora tag value to match.
+  LogClass:
+    Type: String
+    Default: INFREQUENT_ACCESS
+    AllowedValues: [INFREQUENT_ACCESS, STANDARD]
+    Description: Target CloudWatch Logs log class.
+  LogRetentionDays:
+    Type: String
+    Default: '90'
+    Description: Retention (days) for recreated log groups. Empty string keeps "never expire".
+  VerifyDelayMinutes:
+    Type: Number
+    Default: 2
+    Description: Minutes to wait before the Re-enabler runs (lets RDS finish modifying).
+  CodeS3Bucket:
+    Type: String
+    Description: S3 bucket holding the Lambda deployment packages.
+  InitiatorS3Key:
+    Type: String
+    Default: InitiatorCWIA.zip
+    Description: S3 key for the Initiator Lambda zip.
+  ReEnablerS3Key:
+    Type: String
+    Default: rds_re_enabler_CWIA.zip
+    Description: S3 key for the Re-enabler Lambda zip.
+  ResourceSuffix:
+    Type: String
+    Default: ''
+    Description: Optional suffix appended to resource names to avoid collisions (e.g. "-cfn").
+
+Resources:
+
+  CWIAManagedPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub 'BlogCWIAPolicy${ResourceSuffix}'
+      Description: Shared policy for RDS CloudWatch IA migration Lambda functions.
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: RDSDescribeAndModify
+            Effect: Allow
+            Action:
+              - rds:DescribeDBInstances
+              - rds:DescribeDBClusters
+              - rds:ModifyDBInstance
+              - rds:ModifyDBCluster
+            Resource:
+              - !Sub 'arn:aws:rds:${AWS::Region}:${AWS::AccountId}:db:*'
+              - !Sub 'arn:aws:rds:${AWS::Region}:${AWS::AccountId}:cluster:*'
+          # DescribeLogGroups does NOT support resource-level scoping; must be "*".
+          - Sid: CloudWatchLogsDescribe
+            Effect: Allow
+            Action: logs:DescribeLogGroups
+            Resource: '*'
+          - Sid: CloudWatchLogsManage
+            Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:DeleteLogGroup
+              - logs:PutRetentionPolicy
+            Resource:
+              - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/rds/instance*'
+              - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/rds/cluster*'
+          - Sid: EventBridgeManage
+            Effect: Allow
+            Action:
+              - events:PutRule
+              - events:PutTargets
+              - events:RemoveTargets
+              - events:DeleteRule
+            Resource: !Sub 'arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/rds-log-migration-*'
+          - Sid: LambdaPermissions
+            Effect: Allow
+            Action:
+              - lambda:AddPermission
+              - lambda:RemovePermission
+            Resource: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:rds-re-enabler-CWIA${ResourceSuffix}'
+          - Sid: SESNotification
+            Effect: Allow
+            Action: ses:SendEmail
+            Resource:
+              - !Sub 'arn:aws:ses:${AWS::Region}:${AWS::AccountId}:identity/${SesSenderEmail}'
+              - !Sub 'arn:aws:ses:${AWS::Region}:${AWS::AccountId}:identity/${SesRecipientEmail}'
+
+  ReEnablerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'rds-re-enabler-CWIA-role${ResourceSuffix}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !Ref CWIAManagedPolicy
+
+  InitiatorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'InitiatorCWIA-role${ResourceSuffix}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !Ref CWIAManagedPolicy
+
+  ReEnablerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'rds-re-enabler-CWIA${ResourceSuffix}'
+      Runtime: python3.14
+      Architectures: [x86_64]
+      Handler: rds_re_enabler_CWIA.lambda_handler
+      Role: !GetAtt ReEnablerRole.Arn
+      Timeout: 720
+      MemorySize: 128
+      Code:
+        S3Bucket: !Ref CodeS3Bucket
+        S3Key: !Ref ReEnablerS3Key
+      Environment:
+        Variables:
+          SES_SENDER_EMAIL: !Ref SesSenderEmail
+          SES_RECIPIENT_EMAIL: !Ref SesRecipientEmail
+
+  InitiatorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'InitiatorCWIA${ResourceSuffix}'
+      Runtime: python3.14
+      Architectures: [x86_64]
+      Handler: InitiatorCWIA.lambda_handler
+      Role: !GetAtt InitiatorRole.Arn
+      Timeout: 60
+      MemorySize: 128
+      Code:
+        S3Bucket: !Ref CodeS3Bucket
+        S3Key: !Ref InitiatorS3Key
+      Environment:
+        Variables:
+          TAG_KEY: !Ref TagKey
+          TAG_VALUE: !Ref TagValue
+          LOG_CLASS: !Ref LogClass
+          LOG_RETENTION_DAYS: !Ref LogRetentionDays
+          VERIFY_DELAY_MINUTES: !Ref VerifyDelayMinutes
+          LAMBDA_ARN: !GetAtt ReEnablerFunction.Arn
+
+Outputs:
+  InitiatorFunctionName:
+    Description: Name of the Initiator Lambda. Invoke this to start a migration.
+    Value: !Ref InitiatorFunction
+  ReEnablerFunctionArn:
+    Description: ARN of the Re-enabler Lambda.
+    Value: !GetAtt ReEnablerFunction.Arn
+  ManagedPolicyArn:
+    Description: Shared IAM managed policy ARN.
+    Value: !Ref CWIAManagedPolicy
