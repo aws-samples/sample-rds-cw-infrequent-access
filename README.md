@@ -1,10 +1,21 @@
-## Automate CloudWatch Logs Infrequent Access migration for Amazon RDS and Amazon Aurora
+## Migrate RDS and Aurora logs to CloudWatch Infrequent Access
 
 Automated migration of Amazon RDS and Amazon Aurora CloudWatch log groups from the Standard log class to the Infrequent Access log class using AWS Lambda, Amazon EventBridge, and Amazon SES.  
 
 ## Overview                                                                                                                                                                            
                                                                                                                                                                                          
-  This serverless solution automates the end-to-end migration of CloudWatch log groups for Amazon RDS and Aurora from the Standard class to the Infrequent Access class, reducing log ingestion costs by up to 50%. It uses tag-based resource discovery, handles log group recreation, schedules re-enablement of log exports, and sends verification emails upon completion.                                                                                                                                                                            
+Amazon RDS and Aurora publish database logs to CloudWatch log groups in the Standard log class by default. Many of these logs — general, error, slow query, audit — shift to periodic use over time: compliance reviews, occasional troubleshooting, historical analysis. The Infrequent Access log class serves these workloads at 50% lower ingestion cost with the same
+durability and Logs Insights query support.
+  
+CloudWatch does not allow a log group's class to be changed after creation, so migrating means deleting and recreating each log group. This solution automates that at fleet scale with tag-based targeting, scheduled re-enablement, and email verification.    
+
+This solution deletes and recreates CloudWatch log groups. Read this section before deploying.
+- Existing log data is deleted. Log groups are removed as part of the migration. If you need historical logs, export them to Amazon S3 first (see Before you migrate (#before-you-migrate)).
+- Temporary log gap. Log delivery is briefly suspended while log groups are deleted and recreated. Run this during a low-activity window.
+- No subscription or metric filters. Infrequent Access log groups do not support them. If any monitoring or alerting pipeline depends on metric filters or subscription filters
+  against these log groups, leave those groups in the Standard class — migrating them will silently break those alarms.
+- Data protection is not free on IA. Standard log groups include data protection (masking and auditing) at no additional cost. On Infrequent Access it carries an additional per-GB
+  charge. Factor this in if you use it.
                                                                                                                                                                                          
   ## Features                                                                                                                                                                            
                                                                                                                                                                                          
@@ -30,7 +41,11 @@ Automated migration of Amazon RDS and Amazon Aurora CloudWatch log groups from t
   - An email address verified in Amazon SES to receive notifications                                                                                                                     
   - An Amazon RDS instance or Aurora cluster with at least one CloudWatch log export enabled                                                                                             
   - Python 3.14 runtime support in Lambda                                                                                                                                                
-                                                                                                                                                                                         
+  Before you migrate
+  
+If you need to keep existing log data, export it to S3 first. Note two constraints: log data can take up to 12 hours to become available for export, and the export captures only what existed when it started — logs generated during the export are not included.
+  
+For continuous export, consider a near real-time pipeline with Amazon Data Firehose instead. See Automate the export of Amazon RDS for MySQL or Amazon Aurora MySQL audit logs to Amazon S3 (https://aws.amazon.com/blogs/database/automate-the-export-of-amazon-rds-for-mysql-or-amazon-aurora-mysql-audit-logs-to-amazon-s3-with-batching-or-near-real-time-processing/).                                                                                                                                                                                 
   ## Lambda Functions                                                                                                                                                                    
                                                                                                                                                                                          
   | Function | File | Description |                                                                                                                                                      
@@ -60,7 +75,7 @@ Automated migration of Amazon RDS and Amazon Aurora CloudWatch log groups from t
                                                                                                                                                                                          
   ## Deployment                                                                                                                                                                          
                                                                                                                                                                                          
-  For complete deployment instructions, see the accompanying blog post: [Automate CloudWatch Logs Infrequent Access migration for Amazon RDS and Amazon Aurora]
+  For complete deployment instructions, see the accompanying blog post: https://aws.amazon.com/blogs/database/migrate-rds-and-aurora-logs-to-cloudwatch-infrequent-access/
 
 ## Security
 
